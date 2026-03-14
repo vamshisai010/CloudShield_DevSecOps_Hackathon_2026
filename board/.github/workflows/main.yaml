@@ -26,15 +26,15 @@ jobs:
     - name: Set up Java
       uses: actions/setup-java@v3
       with:
-        distribution: 'temurin'
-        java-version: '17'
+        distribution: temurin
+        java-version: 17
 
     - name: Build with Maven
-      run: mvn clean package
+      run: mvn -f board/pom.xml clean package -DskipTests
 
     - name: SonarQube Scan
       run: |
-        mvn sonar:sonar \
+        mvn -f board/pom.xml sonar:sonar \
         -Dsonar.projectKey=train-ticket \
         -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
         -Dsonar.login=${{ secrets.SONAR_TOKEN }}
@@ -52,11 +52,7 @@ jobs:
 
     - name: Build Docker Image
       run: |
-        docker build -t $ECR_REGISTRY .
-
-    - name: Tag Image
-      run: |
-        docker tag train-ticket:latest 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./board
 
     - name: Push Image to ECR
       run: |
@@ -64,6 +60,7 @@ jobs:
 
     - name: Install Trivy
       run: |
+        sudo apt-get update
         sudo apt-get install wget -y
         wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.1_Linux-64bit.deb
         sudo dpkg -i trivy_0.50.1_Linux-64bit.deb
@@ -74,11 +71,9 @@ jobs:
 
     - name: Update kubeconfig
       run: |
-        aws eks update-kubeconfig --region ap-south-1 --name $EKS_CLUSTER_NAME
+        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
 
     - name: Deploy to EKS
       run: |
         kubectl apply -f k8s/deployment.yaml
         kubectl apply -f k8s/service.yaml
-
-
