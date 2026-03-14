@@ -12,8 +12,8 @@ env:
   IMAGE_TAG: latest
 
 jobs:
-
   build:
+
     runs-on: ubuntu-latest
 
     steps:
@@ -78,7 +78,16 @@ jobs:
         key: ${{ secrets.SERVER_SSH_KEY }}
         port: 22
         script: |
-          cd /home/ubuntu/CloudShield_DevSecOps_Hackathon_2026
-          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          if [ ! -d "CloudShield_DevSecOps_Hackathon_2026" ]; then
+            git clone https://github.com/vamshisai010/CloudShield_DevSecOps_Hackathon_2026.git
+          fi
+
+          cd CloudShield_DevSecOps_Hackathon_2026
+
+          docker login -u AWS -p $(aws ecr get-login-password --region ap-south-1) 846697434284.dkr.ecr.ap-south-1.amazonaws.com
+
+          docker pull 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
+
           sudo k3s kubectl apply -f k8s/deployment.yaml
           sudo k3s kubectl apply -f k8s/service.yaml
