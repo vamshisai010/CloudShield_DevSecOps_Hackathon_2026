@@ -10,14 +10,14 @@ env:
   ECR_REGISTRY: 846697434284.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: train-ticket
   IMAGE_TAG: latest
+  KUBE_NAMESPACE: default
+  KUBE_CONFIG_PATH: $HOME/.kube/config
 
 jobs:
-  build:
-
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-
     - name: Checkout Code
       uses: actions/checkout@v3
 
@@ -53,7 +53,7 @@ jobs:
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
 
-    - name: Push Image to ECR
+    - name: Push Docker Image to ECR
       run: |
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -70,47 +70,53 @@ jobs:
       run: |
         trivy image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    - name: Deploy to K3s Server with ECR Secret and CRT
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.SERVER_IP }}
-        username: ubuntu
-        key: ${{ secrets.SERVER_SSH_KEY }}
-        port: 22
-        script: |
+    - name: Configure kubeconfig for K3s / EKS
+      env:
+        KUBE_CONFIG_PATH: ${{ env.KUBE_CONFIG_PATH }}
+      run: |
+        mkdir -p $(dirname $KUBE_CONFIG_PATH)
+        # For K3s EC2 instance
+        scp -i ${{ secrets.SERVER_SSH_KEY }} -o StrictHostKeyChecking=no \
+          ubuntu@${{ secrets.SERVER_IP }}:/etc/rancher/k3s/k3s.yaml $KUBE_CONFIG_PATH
+        sed -i "s/127.0.0.1/${{ secrets.SERVER_IP }}/g" $KUBE_CONFIG_PATH
+        export KUBECONFIG=$KUBE_CONFIG_PATH
+        kubectl get nodes
 
-          # Clone repo if not exists
-          if [ ! -d "CloudShield_DevSecOps_Hackathon_2026" ]; then
-            git clone https://github.com/vamshisai010/CloudShield_DevSecOps_Hackathon_2026.git
-          fi
-          cd CloudShield_DevSecOps_Hackathon_2026
+    - name: Create / Update ECR Secret in Kubernetes
+      env:
+        AWS_REGION: ${{ env.AWS_REGION }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
+        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
+      run: |
+        kubectl delete secret ecr-secret --ignore-not-found -n ${{ env.KUBE_NAMESPACE }}
+        kubectl create secret docker-registry ecr-secret \
+          --docker-server=$ECR_REGISTRY \
+          --docker-username=AWS \
+          --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
+          --namespace ${{ env.KUBE_NAMESPACE }}
 
-          # Optional: Install CA certificate if needed
-          sudo cp certs/mycluster.crt /usr/local/share/ca-certificates/
-          sudo update-ca-certificates
+    - name: Apply Kubernetes Manifests
+      env:
+        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
+      run: |
+        # Optional: Add CRT to kubelet trusted store if needed
+        # sudo cp certs/mycluster.crt /usr/local/share/ca-certificates/
+        # sudo update-ca-certificates
 
-          # Login to ECR
-          aws ecr get-login-password --region ap-south-1 \
-          | docker login --username AWS --password-stdin 846697434284.dkr.ecr.ap-south-1.amazonaws.com
+        kubectl apply -f k8s/deployment.yaml -n ${{ env.KUBE_NAMESPACE }}
+        kubectl apply -f k8s/service.yaml -n ${{ env.KUBE_NAMESPACE }}
 
-          # Pull latest image
-          docker pull 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
+        # Ensure pods use the secret
+        kubectl patch deployment train-ticket-deployment -n ${{ env.KUBE_NAMESPACE }} \
+          -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ecr-secret"}]}}}}'
 
-          # Recreate ECR secret for Kubernetes
-          sudo k3s kubectl delete secret ecr-secret --ignore-not-found
-          sudo k3s kubectl create secret docker-registry ecr-secret \
-            --docker-server=846697434284.dkr.ecr.ap-south-1.amazonaws.com \
-            --docker-username=AWS \
-            --docker-password=$(aws ecr get-login-password --region ap-south-1) \
-            --namespace default
+        # Restart deployment to pull latest image
+        kubectl rollout restart deployment train-ticket-deployment -n ${{ env.KUBE_NAMESPACE }}
 
-          # Apply Kubernetes manifests
-          sudo k3s kubectl apply -f k8s/deployment.yaml
-          sudo k3s kubectl apply -f k8s/service.yaml
-
-          # Make sure the deployment pulls the image with the secret
-          sudo k3s kubectl patch deployment train-ticket-deployment \
-            -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ecr-secret"}]}}}}'
-
-          # Restart deployment to pick up latest image
-          sudo k3s kubectl rollout restart deployment train-ticket-deployment
+    - name: Verify Deployment
+      env:
+        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
+      run: |
+        kubectl get pods -n ${{ env.KUBE_NAMESPACE }}
+        kubectl get svc -n ${{ env.KUBE_NAMESPACE }}
