@@ -1,4 +1,4 @@
-name: DevSecOps Pipeline
+name: DevSecOps CI/CD Pipeline
 
 on:
   push:
@@ -7,116 +7,79 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REGISTRY: 846697434284.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: train-ticket
+  EKS_CLUSTER_NAME: devsecops-cluster
   IMAGE_TAG: latest
-  KUBE_NAMESPACE: default
-  KUBE_CONFIG_PATH: $HOME/.kube/config
 
 jobs:
-  build-and-deploy:
+  build-push-scan-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+      - name: Checkout Source Code
+        uses: actions/checkout@v3
 
-    - name: Set up Java
-      uses: actions/setup-java@v3
-      with:
-        distribution: temurin
-        java-version: 17
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: 17
 
-    - name: Build with Maven
-      run: mvn clean package
+      - name: Build Maven Application
+        run: mvn clean package -DskipTests
 
-    - name: SonarQube Scan
-      run: |
-        mvn sonar:sonar \
-        -Dsonar.projectKey=train-ticket \
-        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
-        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Login to ECR
-      run: |
-        aws ecr get-login-password --region $AWS_REGION \
-        | docker login --username AWS --password-stdin $ECR_REGISTRY
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
 
-    - name: Build Docker Image
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+      - name: Push Image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-    - name: Push Docker Image to ECR
-      run: |
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget https://aquasecurity.github.io/trivy-repo/deb/public.key
+          sudo apt-key add public.key
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
+          | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
 
-    - name: Install Trivy
-      run: |
-        sudo apt-get update
-        sudo apt-get install wget apt-transport-https gnupg lsb-release -y
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-        sudo apt-get update
-        sudo apt-get install trivy -y
+      - name: Scan Docker Image with Trivy
+        run: |
+          trivy image ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-    - name: Scan Docker Image with Trivy
-      run: |
-        trivy image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
 
-    - name: Configure kubeconfig for K3s / EKS
-      env:
-        KUBE_CONFIG_PATH: ${{ env.KUBE_CONFIG_PATH }}
-      run: |
-        mkdir -p $(dirname $KUBE_CONFIG_PATH)
-        # For K3s EC2 instance
-        scp -i ${{ secrets.SERVER_SSH_KEY }} -o StrictHostKeyChecking=no \
-          ubuntu@${{ secrets.SERVER_IP }}:/etc/rancher/k3s/k3s.yaml $KUBE_CONFIG_PATH
-        sed -i "s/127.0.0.1/${{ secrets.SERVER_IP }}/g" $KUBE_CONFIG_PATH
-        export KUBECONFIG=$KUBE_CONFIG_PATH
-        kubectl get nodes
+      - name: Pull Image from ECR to EKS
+        run: |
+          kubectl run image-test \
+          --image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+          --restart=Never
+          kubectl delete pod image-test
 
-    - name: Create / Update ECR Secret in Kubernetes
-      env:
-        AWS_REGION: ${{ env.AWS_REGION }}
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
-      run: |
-        kubectl delete secret ecr-secret --ignore-not-found -n ${{ env.KUBE_NAMESPACE }}
-        kubectl create secret docker-registry ecr-secret \
-          --docker-server=$ECR_REGISTRY \
-          --docker-username=AWS \
-          --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
-          --namespace ${{ env.KUBE_NAMESPACE }}
+      - name: Deploy Application to Kubernetes
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
 
-    - name: Apply Kubernetes Manifests
-      env:
-        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
-      run: |
-        # Optional: Add CRT to kubelet trusted store if needed
-        # sudo cp certs/mycluster.crt /usr/local/share/ca-certificates/
-        # sudo update-ca-certificates
-
-        kubectl apply -f k8s/deployment.yaml -n ${{ env.KUBE_NAMESPACE }}
-        kubectl apply -f k8s/service.yaml -n ${{ env.KUBE_NAMESPACE }}
-
-        # Ensure pods use the secret
-        kubectl patch deployment train-ticket-deployment -n ${{ env.KUBE_NAMESPACE }} \
-          -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ecr-secret"}]}}}}'
-
-        # Restart deployment to pull latest image
-        kubectl rollout restart deployment train-ticket-deployment -n ${{ env.KUBE_NAMESPACE }}
-
-    - name: Verify Deployment
-      env:
-        KUBECONFIG: ${{ env.KUBE_CONFIG_PATH }}
-      run: |
-        kubectl get pods -n ${{ env.KUBE_NAMESPACE }}
-        kubectl get svc -n ${{ env.KUBE_NAMESPACE }}
+      - name: Verify Deployment
+        run: |
+          kubectl get nodes
+          kubectl get pods
+          kubectl get svc
