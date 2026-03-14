@@ -70,7 +70,7 @@ jobs:
       run: |
         trivy image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    - name: Deploy to K3s Server
+    - name: Deploy to K3s Server with ECR Secret and CRT
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.SERVER_IP }}
@@ -79,25 +79,38 @@ jobs:
         port: 22
         script: |
 
+          # Clone repo if not exists
           if [ ! -d "CloudShield_DevSecOps_Hackathon_2026" ]; then
             git clone https://github.com/vamshisai010/CloudShield_DevSecOps_Hackathon_2026.git
           fi
-
           cd CloudShield_DevSecOps_Hackathon_2026
 
+          # Optional: Install CA certificate if needed
+          sudo cp certs/mycluster.crt /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+
+          # Login to ECR
           aws ecr get-login-password --region ap-south-1 \
           | docker login --username AWS --password-stdin 846697434284.dkr.ecr.ap-south-1.amazonaws.com
 
+          # Pull latest image
           docker pull 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
 
+          # Recreate ECR secret for Kubernetes
           sudo k3s kubectl delete secret ecr-secret --ignore-not-found
-
           sudo k3s kubectl create secret docker-registry ecr-secret \
-          --docker-server=846697434284.dkr.ecr.ap-south-1.amazonaws.com \
-          --docker-username=AWS \
-          --docker-password=$(aws ecr get-login-password --region ap-south-1)
+            --docker-server=846697434284.dkr.ecr.ap-south-1.amazonaws.com \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region ap-south-1) \
+            --namespace default
 
+          # Apply Kubernetes manifests
           sudo k3s kubectl apply -f k8s/deployment.yaml
           sudo k3s kubectl apply -f k8s/service.yaml
 
+          # Make sure the deployment pulls the image with the secret
+          sudo k3s kubectl patch deployment train-ticket-deployment \
+            -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ecr-secret"}]}}}}'
+
+          # Restart deployment to pick up latest image
           sudo k3s kubectl rollout restart deployment train-ticket-deployment
