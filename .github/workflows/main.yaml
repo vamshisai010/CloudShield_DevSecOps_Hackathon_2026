@@ -85,9 +85,19 @@ jobs:
 
           cd CloudShield_DevSecOps_Hackathon_2026
 
-          docker login -u AWS -p $(aws ecr get-login-password --region ap-south-1) 846697434284.dkr.ecr.ap-south-1.amazonaws.com
+          aws ecr get-login-password --region ap-south-1 \
+          | docker login --username AWS --password-stdin 846697434284.dkr.ecr.ap-south-1.amazonaws.com
 
           docker pull 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
 
+          sudo k3s kubectl delete secret ecr-secret --ignore-not-found
+
+          sudo k3s kubectl create secret docker-registry ecr-secret \
+          --docker-server=846697434284.dkr.ecr.ap-south-1.amazonaws.com \
+          --docker-username=AWS \
+          --docker-password=$(aws ecr get-login-password --region ap-south-1)
+
           sudo k3s kubectl apply -f k8s/deployment.yaml
           sudo k3s kubectl apply -f k8s/service.yaml
+
+          sudo k3s kubectl rollout restart deployment train-ticket-deployment
