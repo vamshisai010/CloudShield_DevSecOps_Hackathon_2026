@@ -9,13 +9,11 @@ env:
   AWS_REGION: ap-south-1
   ECR_REGISTRY: 846697434284.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: train-ticket
-  EKS_CLUSTER_NAME: devsecops-cluster
   IMAGE_TAG: latest
 
 jobs:
 
   build:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -30,11 +28,11 @@ jobs:
         java-version: 17
 
     - name: Build with Maven
-      run: mvn -f pom.xml clean package
+      run: mvn clean package
 
     - name: SonarQube Scan
       run: |
-        mvn -f pom.xml sonar:sonar \
+        mvn sonar:sonar \
         -Dsonar.projectKey=train-ticket \
         -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
         -Dsonar.login=${{ secrets.SONAR_TOKEN }}
@@ -48,7 +46,8 @@ jobs:
 
     - name: Login to ECR
       run: |
-        aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+        aws ecr get-login-password --region $AWS_REGION \
+        | docker login --username AWS --password-stdin $ECR_REGISTRY
 
     - name: Build Docker Image
       run: |
@@ -71,11 +70,14 @@ jobs:
       run: |
         trivy image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-
-    - name: Deploy to EKS
-      run: |
-        kubectl apply -f k8s/deployment.yaml
-        kubectl apply -f k8s/service.yaml
+    - name: Deploy to K3s Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ubuntu
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          cd /home/ubuntu/CloudShield_DevSecOps_Hackathon_2026
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          sudo k3s kubectl apply -f k8s/deployment.yaml
+          sudo k3s kubectl apply -f k8s/service.yaml
