@@ -1,0 +1,82 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 846697434284.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: train-ticket
+  EKS_CLUSTER_NAME: devsecops-cluster
+  IMAGE_TAG: latest
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Build with Maven
+      run: mvn clean package
+
+    - name: SonarQube Scan
+      run: |
+        mvn sonar:sonar \
+        -Dsonar.projectKey=train-ticket \
+        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v3
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to ECR
+      run: |
+        aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+    - name: Build Docker Image
+      run: |
+        docker build -t $ECR_REGISTRY .
+
+    - name: Tag Image
+      run: |
+        docker tag train-ticket:latest 846697434284.dkr.ecr.ap-south-1.amazonaws.com/train-ticket:latest
+
+    - name: Push Image to ECR
+      run: |
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Install Trivy
+      run: |
+        sudo apt-get install wget -y
+        wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.1_Linux-64bit.deb
+        sudo dpkg -i trivy_0.50.1_Linux-64bit.deb
+
+    - name: Scan Docker Image with Trivy
+      run: |
+        trivy image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ap-south-1 --name $EKS_CLUSTER_NAME
+
+    - name: Deploy to EKS
+      run: |
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
